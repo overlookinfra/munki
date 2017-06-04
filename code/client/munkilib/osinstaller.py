@@ -36,6 +36,8 @@ from Foundation import kCFPreferencesCurrentHost
 # pylint: enable=E0611
 
 # our imports
+import munkilib.authrestart.client as authrestartd
+
 from . import FoundationPlist
 from . import authrestart
 from . import display
@@ -47,6 +49,7 @@ from . import osutils
 from . import pkgutils
 from . import prefs
 from . import processes
+from . import scriptutils
 
 
 CHECKANDINSTALLATSTARTUPFLAG = \
@@ -89,8 +92,9 @@ class StartOSInstallError(Exception):
 class StartOSInstallRunner(object):
     '''Handles running startosinstall to set up and kick off an upgrade install
     of macOS'''
-    def __init__(self, installer, finishing_tasks=None):
+    def __init__(self, installer, finishing_tasks=None, installinfo=None):
         self.installer = installer
+        self.installinfo = installinfo
         self.finishing_tasks = finishing_tasks
         self.dmg_mountpoint = None
         self.got_sigusr1 = False
@@ -100,7 +104,11 @@ class StartOSInstallRunner(object):
         done setting up the macOS install and is ready and waiting to reboot'''
         display.display_debug1('Got SIGUSR1 from startosinstall')
         self.got_sigusr1 = True
-        # do stuff here: cleanup, record-keeping, notifications
+        # do cleanup, record-keeping, notifications
+        if self.installinfo and 'postinstall_script' in self.installinfo:
+            # run the postinstall_script
+            dummy_retcode = scriptutils.run_embedded_script(
+                'postinstall_script', self.installinfo)
         if self.finishing_tasks:
             self.finishing_tasks()
         # set Munki to run at boot after the OS upgrade is complete
@@ -116,7 +124,10 @@ class StartOSInstallRunner(object):
                 os.unlink(self.installer)
             except (IOError, OSError):
                 pass
-        if authrestart.can_attempt_auth_restart():
+        # ask authrestartd if we can do an auth restart, or look for a recovery
+        # key (via munkilib.authrestart methods)
+        if (authrestartd.verify_can_attempt_auth_restart() or
+                authrestart.can_attempt_auth_restart()):
             # set a secret preference to tell the osinstaller process to exit
             # instead of restart
             # this is the equivalent of:
@@ -163,6 +174,15 @@ class StartOSInstallRunner(object):
         Will always reboot after if the setup is successful.
         Therefore this must be done at the end of all other actions that Munki
         performs during a managedsoftwareupdate run.'''
+
+        if self.installinfo and 'preinstall_script' in self.installinfo:
+            # run the postinstall_script
+            retcode = scriptutils.run_embedded_script(
+                'preinstall_script', self.installinfo)
+            if retcode:
+                # don't install macOS, return failure
+                raise StartOSInstallError(
+                    'Skipping macOS upgrade due to preinstall_script error.')
 
         # set up our signal handler
         signal.signal(signal.SIGUSR1, self.sigusr1_handler)
@@ -277,6 +297,9 @@ class StartOSInstallRunner(object):
                 pass
             elif msg.startswith('Helper tool creashed'):
                 # no need to print that stupid message to screen!
+                # yes, 'creashed' is misspelled. This is not a Munki bug/typo,
+                # this is an Apple typo. But we have to match against what
+                # Apple outputs.
                 munkilog.log(msg)
             elif msg.startswith(
                     ('Signaling PID:', 'Waiting to reboot',
@@ -322,8 +345,9 @@ class StartOSInstallRunner(object):
                 CFPreferencesSetValue(
                     'IAQuitInsteadOfReboot', None, '.GlobalPreferences',
                     kCFPreferencesAnyUser, kCFPreferencesCurrentHost)
-                # restart
-                authrestart.do_authorized_or_normal_restart()
+                # attempt to do an auth restart, or regular restart
+                if not authrestartd.restart():
+                    authrestart.do_authorized_or_normal_restart()
         else:
             raise StartOSInstallError(
                 'startosinstall did not complete successfully. '
@@ -355,13 +379,14 @@ def get_catalog_info(mounted_dmgpath):
     return None
 
 
-def startosinstall(installer, finishing_tasks=None):
+def startosinstall(installer, finishing_tasks=None, installinfo=None):
     '''Run startosinstall to set up an install of macOS, using a Install app
     installed locally or located on a given disk image. Returns True if
     startosinstall completes successfully, False otherwise.'''
     try:
         StartOSInstallRunner(
-            installer, finishing_tasks=finishing_tasks).start()
+            installer,
+            finishing_tasks=finishing_tasks, installinfo=installinfo).start()
         return True
     except StartOSInstallError, err:
         display.display_error(
@@ -386,7 +411,6 @@ def run(finishing_tasks=None):
     if prefs.pref('SuppressStopButtonOnInstall'):
         munkistatus.hideStopButton()
 
-    munkilog.log("### Beginning os installer session ###")
     success = False
     if "managed_installs" in installinfo:
         if not processes.stop_requested():
@@ -395,14 +419,25 @@ def run(finishing_tasks=None):
                 item for item in installinfo['managed_installs']
                 if item.get('installer_type') == 'startosinstall']
             if installlist:
+                munkilog.log("### Beginning os installer session ###")
                 item = installlist[0]
-                if 'installer_item' in item:
-                    display.display_status_major('Starting macOS upgrade...')
-                    # set indeterminate progress bar
-                    munkistatus.percent(-1)
-                    itempath = os.path.join(cachedir, item["installer_item"])
-                    success = startosinstall(
-                        itempath, finishing_tasks=finishing_tasks)
+                if not 'installer_item' in item:
+                    display.display_error(
+                        'startosinstall item is missing installer_item.')
+                    return False
+                display.display_status_major('Starting macOS upgrade...')
+                # set indeterminate progress bar
+                munkistatus.percent(-1)
+                # remove the InstallInfo.plist since it won't be valid
+                # after the upgrade
+                try:
+                    os.unlink(installinfopath)
+                except (OSError, IOError):
+                    pass
+                itempath = os.path.join(cachedir, item["installer_item"])
+                success = startosinstall(
+                    itempath,
+                    finishing_tasks=finishing_tasks, installinfo=item)
     munkilog.log("### Ending os installer session ###")
     return success
 
